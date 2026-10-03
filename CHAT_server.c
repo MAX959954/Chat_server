@@ -1,220 +1,348 @@
-#define _POSIX_C_SOURCE 200112L
+/*
+ * Single-threaded, select()-based multi-client TCP chat server.
+ * POSIX only (Linux / WSL / macOS) - see README.md.
+ */
+#define _POSIX_C_SOURCE 200809L
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <netdb.h>
-#include <sys/socket.h>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 
-#define TRUE 1
-#define FALSE 0
+/* Linux suppresses SIGPIPE per call with MSG_NOSIGNAL; other systems rely on
+ * SIGPIPE being ignored process-wide (done in main). */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
-int main () {
+enum {
+    NAME_SIZE        = 64,   /* fits any numeric IPv4/IPv6 address */
+    MSG_SIZE         = 4096, /* max bytes accepted per recv() */
+    BACKLOG          = 10,   /* pending connections passed to listen() */
+    SEND_TIMEOUT_SEC = 2     /* a client that blocks send() longer is dropped */
+};
 
-    /* define variables here */
-    const char *port = "65001";   /* same port as the client */
-    const int clientname_size = 32; /* store client's IPv4 address */
+static const char *const DEFAULT_PORT = "65001";
 
-    char clientname[clientname_size];
-    char buffer[BUFSIZ] , sendstr[BUFSIZ];
-    const int backlog  = 10;  //max pending connections passed to listen()
-    char connection[FD_SETSIZE][clientname_size];/* storage for IPv4 connections, indexed by fd */
-    
-    socklen_t address_len = sizeof(struct sockaddr);
-    struct addrinfo hints , *server;
-    struct sockaddr address ; 
-    int r, max_connect , fd , x , done; 
-    fd_set main_fd , read_fd;
-    int serverfd  , clientfd;
+struct server {
+    int    listen_fd;
+    int    spare_fd;                      /* reserved fd for EMFILE recovery */
+    int    max_fd;                        /* highest fd in `active` */
+    fd_set active;                        /* listener + all live clients */
+    bool   dead[FD_SETSIZE];              /* scheduled for disconnect */
+    bool   is_local[FD_SETSIZE];          /* connected from loopback */
+    char   name[FD_SETSIZE][NAME_SIZE];   /* display name, indexed by fd */
+};
 
-    /* setup the server */
-    memset(&hints , 0 , sizeof(struct addrinfo));
-    hints.ai_family = AF_INET; /* IPv4 */
-    hints.ai_socktype = SOCK_STREAM; /* TCP */
-    hints.ai_flags = AI_PASSIVE; /* accept any connection */
-    r = getaddrinfo(0 , port , &hints , &server);
-    if (r != 0 ) {
-        perror("Failed");
-        exit(1);
+/* ------------------------------------------------------------------------ */
+
+/* Send the whole buffer, retrying on partial writes and EINTR.
+ * Returns false if the peer is gone or blocked longer than SEND_TIMEOUT_SEC. */
+static bool send_all(int fd, const char *buf, size_t len)
+{
+    while (len > 0) {
+        ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;  /* EPIPE, ECONNRESET, EAGAIN (send timeout), ... */
+        }
+        buf += n;
+        len -= (size_t)n;
+    }
+    return true;
+}
+
+/* A failed client is only marked here and closed later in reap_dead(), so fd
+ * numbers are never closed (and reused by accept()) in the middle of a loop
+ * that is iterating over them. */
+static void mark_dead(struct server *s, int fd)
+{
+    s->dead[fd] = true;
+}
+
+static void broadcast(struct server *s, const char *msg, int except_fd)
+{
+    size_t len = strlen(msg);
+    for (int fd = 0; fd <= s->max_fd; fd++) {
+        if (fd == s->listen_fd || fd == except_fd)
+            continue;
+        if (!FD_ISSET(fd, &s->active) || s->dead[fd])
+            continue;
+        if (!send_all(fd, msg, len))
+            mark_dead(s, fd);
+    }
+    fputs(msg, stdout);
+}
+
+/* Close every client marked dead and announce it. Announcing can itself
+ * discover more dead clients, so repeat until nothing changes. */
+static void reap_dead(struct server *s)
+{
+    bool again = true;
+    while (again) {
+        again = false;
+        for (int fd = 0; fd <= s->max_fd; fd++) {
+            if (!s->dead[fd])
+                continue;
+            s->dead[fd] = false;
+            FD_CLR(fd, &s->active);
+            close(fd);
+
+            char msg[NAME_SIZE + 32];
+            snprintf(msg, sizeof msg, "SERVER> %s disconnected\n", s->name[fd]);
+            broadcast(s, msg, -1);
+            again = true;
+        }
+    }
+    while (s->max_fd > s->listen_fd && !FD_ISSET(s->max_fd, &s->active))
+        s->max_fd--;
+}
+
+static bool is_loopback(const struct sockaddr_storage *addr)
+{
+    if (addr->ss_family == AF_INET) {
+        const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+        return (ntohl(in->sin_addr.s_addr) >> 24) == 127;  /* 127.0.0.0/8 */
+    }
+    if (addr->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)addr;
+        return IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr);
+    }
+    return false;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int open_listener(const char *port)
+{
+    struct addrinfo hints, *res, *ai;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = AF_INET;      /* IPv4 */
+    hints.ai_socktype = SOCK_STREAM;  /* TCP */
+    hints.ai_flags    = AI_PASSIVE;   /* bind to all interfaces */
+
+    int r = getaddrinfo(NULL, port, &hints, &res);
+    if (r != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(r));  /* not errno */
+        return -1;
     }
 
+    int fd = -1;
+    for (ai = res; ai != NULL; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd == -1) {
+            perror("socket");
+            continue;
+        }
+        /* allow an immediate restart while old connections sit in TIME_WAIT */
+        int yes = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) == -1)
+            perror("setsockopt(SO_REUSEADDR)");
 
-    //create the socket
-    serverfd = socket(server->ai_family , server->ai_socktype , server->ai_protocol);
-    if(serverfd  == -1) {
-        perror("Failed");
-        exit(1);
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, BACKLOG) == 0)
+            break;
+
+        perror("bind/listen");
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+/* Out of file descriptors: the pending connection keeps the listener readable,
+ * so select() would spin forever. Free the reserved fd, accept the connection
+ * just to close it, then reserve the fd again. */
+static void shed_connection(struct server *s)
+{
+    if (s->spare_fd != -1) {
+        close(s->spare_fd);
+        int fd = accept(s->listen_fd, NULL, NULL);
+        if (fd != -1)
+            close(fd);
+    }
+    s->spare_fd = open("/dev/null", O_RDONLY);
+    fputs("SERVER> out of file descriptors, connection rejected\n", stderr);
+}
+
+static void accept_client(struct server *s)
+{
+    struct sockaddr_storage addr;     /* large enough for any address family */
+    socklen_t addr_len = sizeof addr; /* value-result: reset on every call */
+
+    int fd = accept(s->listen_fd, (struct sockaddr *)&addr, &addr_len);
+    if (fd == -1) {
+        if (errno == EMFILE || errno == ENFILE)
+            shed_connection(s);
+        else if (errno != EINTR && errno != ECONNABORTED && errno != EAGAIN)
+            perror("accept");
+        return;  /* one failed accept must not take the server down */
     }
 
-    //bind the port
-    r = bind(serverfd , server->ai_addr , server->ai_addrlen);
-    if  (r == -1) {
-        perror("Failed");
-        exit(1);
+    /* select() cannot watch fds >= FD_SETSIZE; FD_SET on one is UB and it
+     * would also overflow the per-fd tables in struct server. */
+    if (fd >= FD_SETSIZE) {
+        static const char full[] = "SERVER> Server is full, try again later\n";
+        send_all(fd, full, sizeof full - 1);
+        close(fd);
+        return;
     }
-    
-    //listen the connection
-    puts("Chat Server is listenning...");
 
-    r = listen(serverfd , backlog);
-    if (r == -1) {
-        perror("failed");
-        exit(1);
-    };
+    /* bound how long a non-reading client can stall the whole server */
+    struct timeval tv = { .tv_sec = SEND_TIMEOUT_SEC, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) == -1)
+        perror("setsockopt(SO_SNDTIMEO)");
 
-    //deal with multiple connections
-    FD_ZERO(&main_fd);  ///* initialize file descriptor set */
-    FD_SET(serverfd , &main_fd ); ///* set the server's file descriptor */
-    max_connect = serverfd;/* highest fd currently in main_fd, updated on every accept() */
+    int r = getnameinfo((struct sockaddr *)&addr, addr_len,
+                        s->name[fd], sizeof s->name[fd],
+                        NULL, 0, NI_NUMERICHOST);
+    if (r != 0) {
+        fprintf(stderr, "getnameinfo: %s\n", gai_strerror(r));
+        snprintf(s->name[fd], sizeof s->name[fd], "unknown-%d", fd);
+    }
+    s->is_local[fd] = is_loopback(&addr);
+    s->dead[fd] = false;
 
-    /* endless loop to process the connections */
-    done = FALSE;
+    FD_SET(fd, &s->active);
+    if (fd > s->max_fd)
+        s->max_fd = fd;
 
+    char msg[NAME_SIZE + 128];
+    snprintf(msg, sizeof msg,
+             "SERVER> Welcome %s to the chat server\n"
+             "SERVER> Type 'shutdown' to stop the server (localhost only)\n",
+             s->name[fd]);
+    if (!send_all(fd, msg, strlen(msg)))
+        mark_dead(s, fd);
+
+    snprintf(msg, sizeof msg, "SERVER> %s has joined the server\n", s->name[fd]);
+    broadcast(s, msg, fd);
+}
+
+/* Strip trailing "\r\n" / "\n" so commands work from both nc and telnet. */
+static void chomp(char *str)
+{
+    size_t len = strlen(str);
+    while (len > 0 && (str[len - 1] == '\n' || str[len - 1] == '\r'))
+        str[--len] = '\0';
+}
+
+/* Returns true if the client asked for (and is allowed to request) shutdown. */
+static bool handle_client(struct server *s, int fd)
+{
+    char buf[MSG_SIZE];
+    ssize_t n = recv(fd, buf, sizeof buf - 1, 0);  /* leave room for '\0' */
+    if (n == 0) {                                   /* orderly close */
+        mark_dead(s, fd);
+        return false;
+    }
+    if (n < 0) {
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+            mark_dead(s, fd);
+        return false;
+    }
+    buf[n] = '\0';
+
+    char cmd[MSG_SIZE];
+    memcpy(cmd, buf, (size_t)n + 1);
+    chomp(cmd);
+
+    if (strcmp(cmd, "shutdown") == 0) {
+        if (s->is_local[fd])
+            return true;
+        static const char denied[] =
+            "SERVER> 'shutdown' is only allowed from localhost\n";
+        if (!send_all(fd, denied, sizeof denied - 1))
+            mark_dead(s, fd);
+        return false;
+    }
+
+    char out[NAME_SIZE + MSG_SIZE + 4];
+    snprintf(out, sizeof out, "%s> %s", s->name[fd], buf);
+    broadcast(s, out, -1);
+    return false;
+}
+
+static void shutdown_server(struct server *s)
+{
+    broadcast(s, "SERVER> Shutdown issued; closing all connections\n", -1);
+    for (int fd = 0; fd <= s->max_fd; fd++) {
+        if (fd != s->listen_fd && FD_ISSET(fd, &s->active))
+            close(fd);
+    }
+    close(s->listen_fd);
+    if (s->spare_fd != -1)
+        close(s->spare_fd);
+}
+
+/* ------------------------------------------------------------------------ */
+
+int main(int argc, char *argv[])
+{
+    const char *port = argc > 1 ? argv[1] : DEFAULT_PORT;
+
+    /* writing to a socket whose peer has gone away must return EPIPE,
+     * not kill the whole process */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGPIPE, &sa, NULL) == -1) {
+        perror("sigaction(SIGPIPE)");
+        return EXIT_FAILURE;
+    }
+
+    static struct server s;  /* ~70 KB of per-fd tables: keep it off the stack */
+    s.listen_fd = open_listener(port);
+    if (s.listen_fd == -1)
+        return EXIT_FAILURE;
+    if (s.listen_fd >= FD_SETSIZE) {
+        fputs("listener fd exceeds FD_SETSIZE\n", stderr);
+        return EXIT_FAILURE;
+    }
+    s.spare_fd = open("/dev/null", O_RDONLY);
+
+    FD_ZERO(&s.active);
+    FD_SET(s.listen_fd, &s.active);
+    s.max_fd = s.listen_fd;
+
+    printf("Chat server is listening on port %s...\n", port);
+    fflush(stdout);
+
+    bool done = false;
     while (!done) {
+        fd_set readable = s.active;  /* select() overwrites its argument */
 
-        /* backup the main file descriptor set into a read set for processing */
-        read_fd = main_fd;
-
-        /* scan the connections for any activity */
-        r = select(max_connect + 1 , &read_fd , NULL , NULL , 0 );
-        if (r == -1) {
-            perror("Failed");
-            exit(1);
+        if (select(s.max_fd + 1, &readable, NULL, NULL, NULL) == -1) {
+            if (errno == EINTR)
+                continue;
+            perror("select");
+            break;
         }
 
-        /* loop to check for active connections */
-        for (fd = 0; fd <= max_connect; fd++) {
-            
-            //filter only active or new clients 
-            if (FD_ISSET(fd , &read_fd)) {
-
-                /* check the server for a new connection */
-                if (fd == serverfd) {
-                    
-                    clientfd = accept(
-                        serverfd , 
-                        (struct sockaddr* ) &address, 
-                        &address_len 
-                    );
-
-                    if (clientfd == -1 ) {
-                        perror("Failed");
-                        exit(1);
-                    }
-
-                    /* connection accepted, get IP address */
-                    r = getnameinfo(
-                        (struct sockaddr*) &address, 
-                        address_len , 
-                        clientname , 
-                        clientname_size , 
-                        0 , 
-                        0, 
-                        NI_NUMERICHOST
-                    );
-
-                    ///* update array of IP addresses */
-                    snprintf(connection[clientfd] , clientname_size , "%s" , clientname);
-                    
-                    /* add new client socket to the file descriptor list */
-                    FD_SET(clientfd , &main_fd);
-                    if (clientfd > max_connect) {
-                        max_connect = clientfd;
-                    }
-
-                    /* welcome the new user: create welcome string and send */
-					/* welcome string: "SERVER> Welcome xxx.xxx.xxx.xxx to the chat server\n"
-					   "Type 'close' to disconnect; 'shtudown' to stop\n" */
-                    snprintf(buffer , sizeof(buffer) ,
-                        "SERVER> Welcome %s to the chat server\n"
-                        "Server> Type 'close' , to disconnect; 'shutdown' to stop \n",
-                        connection[clientfd]);
-                    send(clientfd ,buffer , strlen(buffer) , 0 );
-
-
-                    /* tell everyone else about the new user */
-					/* build the string: "SERVER> xxx.xxx.xxx.xxx has joined the server" */
-                    snprintf(buffer , sizeof(buffer) , "Server>%s has joined to the server\n" , connection[clientfd]);
-
-                    /* loop from the server's file descriptor up,
-					   sending the string to each active connection */
-                    
-                    for(x = serverfd+1; x <= max_connect; x++) {
-                        if(FD_ISSET(x , &main_fd)){
-                            send(x , buffer , strlen(buffer) , 0 );
-                        }
-                    }
-
-                    /* output the string to the local console as well */
-                    printf("%s" , buffer);
-
-                } /* end if to add new client */
-				/* deal with incoming data from an established connection */
-                else {
-
-                    /* check input buffer for the current fd */
-                    r = recv(fd , buffer , BUFSIZ , 0);
-                    
-                    /* if nothing received, disconnect them */
-                    if (r < 1) {
-                        FD_CLR(fd , &main_fd) ; /* clear the file descriptor */
-                        close(fd);
-
-                        //tell other that user has disconnected
-                        //build the string "SERVER> xxx.xxx.xxx.xxx , disconnected"
-                        
-                        snprintf(buffer , sizeof(buffer) , "SERVER> %s disconnected\n" , connection[fd]);
-
-                        //loop through all connections (not the server) to send the string
-                        for (x = serverfd + 1; x <= max_connect; x++)
-                        {
-                            if (FD_ISSET(x , &main_fd)) {
-                                send(x , buffer , strlen(buffer) ,0);
-                            }
-                        }
-                        // output the string locally
-                        printf("%s" , buffer);
-
-                    }
-                    /* at this point, the connected client has text to share */
-					/* share the incoming text with all connections */
-                    else {
-                        buffer[r] = '\0'; /* cap the received string */
-
-                        //first check to see whether the shutdown\n string was sent
-                        if (strcmp(buffer , "shutdown\n") == 0 ){
-                            done = TRUE; //if so , set the loop terminating condition 
-                        }
-                        // otherwise , echo the received string to all connected fds 
-                        else {
-                            // build the string "xxx.xxx.xxx.xxx> [test]"
-                            snprintf(sendstr , sizeof(sendstr) , "%s> %s" , connection[fd] , buffer);
-
-                            //loop throught all connections , but not the server 
-                            for (x = serverfd + 1; x <= max_connect; x++ ){
-                                if  (FD_ISSET(x , &main_fd)){
-                                    
-                                    //send the built string 
-                                    send(x , sendstr ,strlen(sendstr), 0 );
-                                }
-                            }
-                            printf("%s" , sendstr);
-                        }
-                    }
-
-                }
-            }
-            
+        for (int fd = 0; fd <= s.max_fd && !done; fd++) {
+            if (!FD_ISSET(fd, &readable))
+                continue;
+            if (fd == s.listen_fd)
+                accept_client(&s);
+            else if (!s.dead[fd])
+                done = handle_client(&s, fd);
         }
-
+        reap_dead(&s);
+        fflush(stdout);
     }
 
-    //generate local message: "SERVER>" shutdown issued cleaning up
-    puts("Server> Shutdown issued; cleaning up");
-    //close the socket and free allocated memory 
-    close(serverfd);
-    freeaddrinfo(server);
-    return(0);
-
+    shutdown_server(&s);
+    return EXIT_SUCCESS;
 }
