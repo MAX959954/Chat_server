@@ -1,112 +1,161 @@
-# Chat Server (select()-based)
+# chat_server
 
-A single-threaded, multi-client TCP chat server written in C. Clients connect
-over TCP, and any message one client sends is broadcast to every connected
-client (including the sender, as an echo). Sending `shutdown` from a client on
-localhost stops the server.
+A single-threaded, event-driven, multi-client TCP chat server in C11.
+
+- Linux **epoll in edge-triggered mode**, with a portable `poll()` backend
+  selectable at build time
+- **non-blocking sockets** with a per-client output queue and **backpressure**:
+  a client that stops reading is disconnected instead of stalling everyone
+- **line framing** over the TCP byte stream (split and coalesced reads handled)
+- **graceful shutdown** on `SIGINT`/`SIGTERM` via the self-pipe trick
+- survives fd exhaustion (`EMFILE`), peer resets (`SIGPIPE`) and malformed input
+- unit tests, integration tests, ASan/UBSan build, clean under `-Wall -Wextra -Wpedantic`
 
 ## Platform
 
-POSIX only (Linux, WSL, macOS). The server uses BSD sockets, `select()` and
-`unistd.h`, so it does not build with MSVC on Windows. On Windows, build and run
-it inside WSL or Docker. CMake stops with a clear error on non-POSIX platforms.
+POSIX only (Linux, WSL, macOS). On Windows, build and run it inside WSL or
+Docker; CMake stops with a clear error on non-POSIX platforms.
 
-## Build
+## Build and run
 
 ```sh
 cmake -B build
 cmake --build build
+./build/chat_server -p 65001
 ```
 
-or directly:
+```
+Usage: chat_server [-p port] [-m max_clients] [-o max_queue_bytes] [-h]
+  -p port             TCP port to listen on (default 65001)
+  -m max_clients      maximum simultaneous clients (default 1000)
+  -o max_queue_bytes  per-client output queue limit before a slow
+                      client is dropped (default 262144)
+```
+
+Connect with `nc localhost 65001` or `telnet localhost 65001` from several terminals.
+Chat messages are echoed to stdout as a transcript; server events are logged to stderr.
+
+Build options:
+
+| Option | Values | Default |
+|---|---|---|
+| `CHAT_POLLER` | `auto`, `epoll`, `poll` | `auto` (epoll on Linux, poll elsewhere) |
+| `CHAT_SANITIZE` | `ON`/`OFF` | `OFF` (AddressSanitizer + UndefinedBehaviorSanitizer) |
+
+## Tests
 
 ```sh
-gcc -std=c11 -Wall -Wextra -Wpedantic -o chat_server CHAT_server.c
+cmake -B build -DCHAT_SANITIZE=ON
+cmake --build build
+cd build && ctest --output-on-failure
 ```
 
-## Test
+- `unit_buffer`, `unit_protocol`: C unit tests for the output queue and the line framer
+  (split lines, coalesced lines, CRLF, empty lines, maximum length, buffer reuse).
+- `integration` (Python 3, Linux/WSL): starts real server processes and checks
+  broadcasting, framing, the line-length limit, peer resets, slow-client backpressure,
+  `/quit`, `/shutdown` rules, `SIGINT`/`SIGTERM`, fast restart, `-m`, fd exhaustion,
+  1100 simultaneous clients (beyond `select()`'s 1024 limit), and that no
+  sanitizer report appears in any server run.
 
-Integration tests (Linux/WSL, Python 3) start the server and check broadcast,
-oversized messages, peer resets, slow clients, shutdown rules, fast restart,
-fd exhaustion and the `FD_SETSIZE` limit:
+## Protocol
 
-```sh
-ulimit -n 4096 && python3 tests/test_server.py ./build/chat_server
+Plain text, one message per line, terminated by `\n` (`\r\n` is accepted).
+Lines longer than 4095 bytes are a protocol violation and disconnect the client.
+
+| Client sends | Effect |
+|---|---|
+| any text | broadcast to every client (sender included) as `ip:port> text` |
+| `/quit` | server replies `SERVER> Bye` and closes the connection |
+| `/shutdown` | stops the server; only accepted from a loopback address |
+| other `/command` | `SERVER> Unknown command: ...` |
+
+Server notices start with `SERVER> ` (welcome, joins, disconnects, errors, shutdown).
+
+## Architecture
+
+```
+src/
+  main.c          command-line parsing
+  server.c/.h     event loop, dispatch, broadcast, shutdown
+  client.c/.h     per-connection state: line reader + output queue
+  protocol.c/.h   line framing and command parsing (no I/O, unit-tested)
+  buffer.c/.h     growable byte FIFO (unit-tested)
+  net.c/.h        socket helpers: listener, accept4, peer names
+  poller.h        readiness API
+  poller_epoll.c  edge-triggered epoll backend
+  poller_poll.c   level-triggered poll() backend
+  log.c/.h        timestamped logging
+tests/
+  test_buffer.c, test_protocol.c, test_server.py
 ```
 
-## Run
+One iteration of the event loop:
 
-```sh
-./build/chat_server          # listens on port 65001
-./build/chat_server 7000     # custom port
 ```
-
-Connect with `nc localhost 65001` (or `telnet localhost 65001`) from as many
-terminals as you like.
+poller_wait()
+  listener ready      -> accept until EAGAIN, register clients
+  signal pipe ready   -> stop the loop
+  client writable     -> flush its output queue
+  client readable     -> recv until EAGAIN, feed the line reader,
+                         dispatch every complete line
+reap_dead()           -> close clients that failed during this iteration
+```
 
 ## Design decisions
 
-**`select()` over threads.** This server multiplexes all client sockets on a
-single thread with `select()`, rather than spawning a thread per connection.
-For a chat server, most sockets are idle most of the time. `select()` avoids
-the cost and complexity of thread creation/teardown and needs no locking
-around shared state (the connection table, the fd set), since only one thread
-ever touches them. The tradeoff is that a slow client or an accidental
-blocking call anywhere in the loop stalls every other client; a
-thread-per-connection design trades that away for higher per-connection
-overhead and mutex-protected shared state instead.
+**Single thread, readiness-based I/O.** Most chat connections are idle, so one
+thread multiplexing every socket is cheaper than a thread per connection and
+needs no locking: only one thread ever touches the client table. The price is
+that nothing in the loop may block, which is why every socket is non-blocking.
 
-**Fixed-size client table indexed by fd, sized to `FD_SETSIZE`.** Each
-client's state (display name, flags) is stored in arrays indexed directly by
-file descriptor. `select()` cannot watch file descriptors `>= FD_SETSIZE`
-(1024 on Linux), so the server explicitly rejects any accepted fd at or above
-that limit with a "server is full" message instead of invoking undefined
-behaviour in `FD_SET`. A production version would replace `select()` with
-`poll()`/`epoll()` (no `FD_SETSIZE` ceiling) and the arrays with a dynamically
-grown table.
+**epoll, edge-triggered.** With edge triggering the kernel reports a socket
+only when its state changes, so every handler drains its socket until `EAGAIN`
+(reads, writes and `accept()`). The code is written to that stricter contract,
+which also makes it correct under the level-triggered `poll()` backend. Write
+readiness is requested only while a client has queued output; otherwise an
+always-writable socket would wake the loop for nothing.
 
-**Deferred disconnects.** When a send or receive fails, the client is only
-*marked* dead; it is closed at the end of the event-loop iteration. Closing
-immediately would let `accept()` reuse that fd number while a loop is still
-iterating over the old one. Announcing a disconnect can reveal further dead
-clients, so reaping repeats until nothing changes.
+**Per-client output queue and backpressure.** Broadcasting appends the message
+to each client's queue and tries to send it immediately. If the kernel buffer
+is full, the rest waits for write readiness. A client whose queue grows past
+`max_queue_bytes` is too slow to keep up and is disconnected. This bounds
+memory per client and guarantees one stuck reader cannot stall the others.
 
-**Text protocol, no framing.** Each `recv()` call is treated as one message.
-This is simple but not correct in general: TCP is a byte stream, not a
-message stream, so a single client message can arrive split across multiple
-`recv()` calls, or multiple messages can arrive coalesced into one `recv()`.
-There is no line-buffering layer yet. For interactive line-by-line chat over a
-local network this rarely surfaces, but it is a known correctness gap.
+**Line framing.** TCP is a byte stream: one `recv()` can return half a line or
+several lines. Each client has a fixed 4 KB line reader; complete lines are
+dispatched, partial ones wait for more bytes, and a full buffer without a
+newline is rejected as a protocol violation, so input memory per client is bounded.
 
-## Robustness
+**Deferred disconnects.** A failing client is only marked dead and is closed at
+the end of the loop iteration. Closing immediately would let `accept()` reuse
+the fd number while events for the old connection are still in the current
+batch. Announcing a disconnect can reveal further dead clients, so reaping
+repeats until nothing changes.
 
-- **No SIGPIPE crashes.** `SIGPIPE` is ignored and sends use `MSG_NOSIGNAL`, so
-  writing to a client that has gone away returns `EPIPE` instead of killing the
-  process.
-- **Complete sends.** `send_all()` retries partial writes and `EINTR`; a client
-  whose send fails is disconnected.
-- **Bounded stall from slow clients.** Client sockets have a 2-second send
-  timeout (`SO_SNDTIMEO`); a client that stops reading is dropped instead of
-  blocking the server forever.
-- **`accept()` failures are not fatal.** Transient errors are logged and the
-  server keeps running. On fd exhaustion (`EMFILE`/`ENFILE`) the server frees a
-  reserved descriptor, accepts and immediately closes the pending connection,
-  then re-reserves it, so `select()` does not spin on a permanently readable
-  listener.
-- **Safe buffers.** `recv()` reads at most `sizeof(buffer) - 1` bytes so the
-  terminating `'\0'` always fits; all formatting goes through bounded `snprintf`.
-- **Fast restart.** The listener sets `SO_REUSEADDR`, so the server can be
-  restarted immediately while old connections are in `TIME_WAIT`.
-- **Restricted shutdown.** Only clients connected from a loopback address may
-  issue `shutdown`; trailing `\r\n` is stripped so it works from both `nc` and
-  `telnet`. On shutdown every client is notified and its socket closed.
+**Signals through a self-pipe.** The `SIGINT`/`SIGTERM` handler only writes a
+byte to a non-blocking pipe watched by the event loop, so all real work runs
+outside signal context. On shutdown the server notifies every client, gives
+queued output up to one second to drain, then closes everything.
+`SIGPIPE` is ignored and sends use `MSG_NOSIGNAL`, so a vanished peer yields
+`EPIPE` instead of killing the process.
+
+**fd exhaustion.** When `accept()` fails with `EMFILE`, the pending connection
+would keep the listener readable forever. The server keeps one spare fd
+reserved: it closes it, accepts and immediately closes the connection, then
+reserves it again.
+
+**Dynamic client table.** Clients live in an intrusive list (for broadcast)
+and a growable fd-indexed array (for O(1) lookup on events), so there is no
+`FD_SETSIZE` ceiling; `-m` sets the policy limit.
 
 ## Known limitations
 
-- No line-buffering: messages can be split or coalesced across `recv()` calls (see above).
-- Blocking sends: a slow client can still stall everyone for up to the 2-second
-  send timeout. The proper fix is non-blocking sockets with per-client output
-  buffers.
-- No authentication, encryption, or rate limiting; trusted-network use only.
-- `select()` caps total simultaneous connections at `FD_SETSIZE` (1024 on Linux).
-- IPv4 only (`hints.ai_family = AF_INET`).
+- No authentication, nicknames, rooms or encryption; trusted-network use only.
+- Fairness: a client that sends continuously is read until `EAGAIN` before
+  others are served. A per-iteration read budget would bound this.
+- Broadcast copies each message into every client's queue (O(clients) memory per
+  message); a shared, reference-counted message would avoid the copies.
+- The stdout transcript is written with blocking stdio; redirect it to a file
+  or `/dev/null` rather than a slow pipe.
+- IPv4 only.
