@@ -7,17 +7,25 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-struct client *client_create(int fd, const char *name, bool is_local)
+struct client *client_create(int fd, const char *addr, bool is_local)
 {
     struct client *c = calloc(1, sizeof *c);
     if (c == NULL)
         return NULL;
     c->fd = fd;
     c->is_local = is_local;
-    snprintf(c->name, sizeof c->name, "%s", name);
+    snprintf(c->addr, sizeof c->addr, "%s", addr);
     line_reader_init(&c->in);
     buffer_init(&c->out);
     return c;
+}
+
+void client_kill(struct client *c, const char *reason)
+{
+    if (c->dead)
+        return;
+    c->dead = true;
+    snprintf(c->quit_reason, sizeof c->quit_reason, "%s", reason);
 }
 
 void client_destroy(struct client *c)

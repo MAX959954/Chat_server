@@ -10,24 +10,21 @@
  * All sockets are non-blocking. Output to each client goes through its own
  * queue; a client whose queue exceeds max_outbuf is disconnected instead of
  * being allowed to stall everyone else (backpressure).
+ *
+ * Chat semantics (nicknames, rooms, commands) live in commands.c.
  */
-#include "server.h"
+#include "server_internal.h"
 
-#include "client.h"
-#include "log.h"
 #include "net.h"
-#include "poller.h"
-#include "protocol.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdarg.h>
-#include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -35,21 +32,7 @@
 enum {
     BACKLOG           = 128,
     MAX_EVENTS        = 256,
-    SHUTDOWN_FLUSH_MS = 1000,  /* time given to deliver the goodbye message */
-    MSG_SIZE          = CLIENT_NAME_SIZE + PROTO_MAX_LINE + 16
-};
-
-struct server {
-    struct server_config cfg;
-    struct poller  *poller;
-    int             listen_fd;
-    int             spare_fd;     /* reserved fd for EMFILE recovery */
-    int             sig_pipe[2];  /* self-pipe: signal handler -> event loop */
-    struct client **by_fd;        /* fd -> client, grown on demand */
-    size_t          by_fd_cap;
-    struct client  *head;         /* list of all clients */
-    int             nclients;
-    bool            stopping;
+    SHUTDOWN_FLUSH_MS = 1000  /* time given to deliver the goodbye message */
 };
 
 /* ------------------------------------------------------------------------ */
@@ -167,6 +150,15 @@ static void table_remove(struct server *s, struct client *c)
     s->nclients--;
 }
 
+struct client *find_by_nick(struct server *s, const char *nick)
+{
+    for (struct client *c = s->head; c != NULL; c = c->next) {
+        if (!c->dead && strcasecmp(c->nick, nick) == 0)
+            return c;
+    }
+    return NULL;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Output                                                                    */
 
@@ -177,7 +169,7 @@ static void set_write_interest(struct server *s, struct client *c, bool want)
     unsigned interest = POLLER_READ | (want ? POLLER_WRITE : 0u);
     if (poller_modify(s->poller, c->fd, interest) == -1) {
         LOG_ERRNO("poller_modify");
-        c->dead = true;
+        client_kill(c, "server error");
         return;
     }
     c->want_write = want;
@@ -186,53 +178,89 @@ static void set_write_interest(struct server *s, struct client *c, bool want)
 static void after_flush(struct server *s, struct client *c, enum flush_result r)
 {
     switch (r) {
-    case FLUSH_DONE:    set_write_interest(s, c, false); break;
-    case FLUSH_PENDING: set_write_interest(s, c, true);  break;
-    case FLUSH_ERROR:   c->dead = true;                  break;
+    case FLUSH_DONE:    set_write_interest(s, c, false);       break;
+    case FLUSH_PENDING: set_write_interest(s, c, true);        break;
+    case FLUSH_ERROR:   client_kill(c, "connection error");    break;
     }
 }
 
-/* Queue a message and try to send it right away. Never blocks. */
-static void send_to(struct server *s, struct client *c, const char *msg, size_t len)
+void send_raw(struct server *s, struct client *c, const char *data, size_t len)
 {
     if (c->dead)
         return;
-    if (client_enqueue(c, msg, len, s->cfg.max_outbuf) == -1) {
-        LOG_INFO("%s: output queue over %zu bytes, dropping slow client",
-                 c->name, s->cfg.max_outbuf);
-        c->dead = true;
+    if (client_enqueue(c, data, len, s->cfg.max_outbuf) == -1) {
+        LOG_INFO("%s (%s): output queue over %zu bytes, dropping slow client",
+                 c->nick, c->addr, s->cfg.max_outbuf);
+        client_kill(c, "too slow");
         return;
     }
     if (!c->want_write)  /* otherwise the socket is known to be full */
         after_flush(s, c, client_flush(c));
 }
 
-static void sendf(struct server *s, struct client *c, const char *fmt, ...)
-    CHAT_PRINTF(3, 4);
-
-static void sendf(struct server *s, struct client *c, const char *fmt, ...)
+/* Format prefix + fmt into one protocol line (at most PROTO_MAX_LINE bytes,
+ * '\n' included). Returns its length. */
+static size_t vformat_line(char *out, const char *prefix, const char *fmt, va_list ap)
 {
-    char msg[MSG_SIZE];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(msg, sizeof msg, fmt, ap);
-    va_end(ap);
-    if (n < 0)
-        return;
-    send_to(s, c, msg, (size_t)n < sizeof msg ? (size_t)n : sizeof msg - 1);
+    size_t cap = PROTO_MAX_LINE - 1;  /* room for '\n' */
+    int p = snprintf(out, cap + 1, "%s", prefix);
+    size_t len = p < 0 ? 0 : (size_t)p;
+    if (len > cap)
+        len = cap;
+    int n = vsnprintf(out + len, cap + 1 - len, fmt, ap);
+    if (n > 0)
+        len = len + (size_t)n > cap ? cap : len + (size_t)n;
+    out[len++] = '\n';
+    return len;
 }
 
-/* Send to every live client except `except` (may be NULL), and echo the
- * message to stdout as the chat transcript. Failures only mark clients dead,
- * so the client list is never modified while it is being walked. */
-static void broadcast(struct server *s, const char *msg, const struct client *except)
+void send_line(struct server *s, struct client *c, const char *fmt, ...)
 {
-    size_t len = strlen(msg);
+    char line[PROTO_MAX_LINE + 1];
+    va_list ap;
+    va_start(ap, fmt);
+    size_t len = vformat_line(line, "", fmt, ap);
+    va_end(ap);
+    send_raw(s, c, line, len);
+}
+
+void send_ok(struct server *s, struct client *c, const char *fmt, ...)
+{
+    char line[PROTO_MAX_LINE + 1];
+    va_list ap;
+    va_start(ap, fmt);
+    size_t len = vformat_line(line, "OK ", fmt, ap);
+    va_end(ap);
+    send_raw(s, c, line, len);
+}
+
+void send_err(struct server *s, struct client *c, enum proto_error code,
+              const char *fmt, ...)
+{
+    char prefix[64];
+    snprintf(prefix, sizeof prefix, "ERR %d %s ", (int)code, proto_error_name(code));
+    char line[PROTO_MAX_LINE + 1];
+    va_list ap;
+    va_start(ap, fmt);
+    size_t len = vformat_line(line, prefix, fmt, ap);
+    va_end(ap);
+    send_raw(s, c, line, len);
+}
+
+void send_room(struct server *s, const char *room, const struct client *except,
+               const char *fmt, ...)
+{
+    char line[PROTO_MAX_LINE + 1];
+    va_list ap;
+    va_start(ap, fmt);
+    size_t len = vformat_line(line, "", fmt, ap);
+    va_end(ap);
+
+    /* failures only mark clients dead, so the list is never modified here */
     for (struct client *c = s->head; c != NULL; c = c->next) {
-        if (c != except)
-            send_to(s, c, msg, len);
+        if (c != except && (room == NULL || strcmp(c->room, room) == 0))
+            send_raw(s, c, line, len);
     }
-    fputs(msg, stdout);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -244,7 +272,8 @@ static void drop_client(struct server *s, struct client *c)
 {
     poller_remove(s->poller, c->fd);
     table_remove(s, c);
-    LOG_INFO("%s disconnected (%d clients)", c->name, s->nclients);
+    LOG_INFO("%s (%s) disconnected: %s (%d clients)",
+             c->nick, c->addr, c->quit_reason, s->nclients);
     client_destroy(c);
 }
 
@@ -255,12 +284,15 @@ static void reap_dead(struct server *s)
         again = false;
         struct client *c = s->head;
         while (c != NULL) {
-            struct client *next = c->next;  /* broadcast() never frees */
+            struct client *next = c->next;  /* senders never free */
             if (c->dead) {
-                char msg[CLIENT_NAME_SIZE + 32];
-                snprintf(msg, sizeof msg, "SERVER> %s disconnected\n", c->name);
+                char nick[sizeof c->nick], room[sizeof c->room];
+                char reason[sizeof c->quit_reason];
+                memcpy(nick, c->nick, sizeof nick);
+                memcpy(room, c->room, sizeof room);
+                memcpy(reason, c->quit_reason, sizeof reason);
                 drop_client(s, c);
-                broadcast(s, msg, NULL);
+                chat_on_disconnect(s, nick, room, reason);
                 again = true;
             }
             c = next;
@@ -287,25 +319,36 @@ static bool shed_connection(struct server *s)
     return fd != -1;
 }
 
-static void reject(int fd, const char *why)
+static void reject(int fd, enum proto_error code, const char *text)
 {
-    ssize_t r = send(fd, why, strlen(why), MSG_NOSIGNAL);  /* best effort */
-    (void)r;
+    char line[256];
+    int n = snprintf(line, sizeof line, "ERR %d %s %s\n",
+                     (int)code, proto_error_name(code), text);
+    if (n > 0) {
+        ssize_t r = send(fd, line, (size_t)n, MSG_NOSIGNAL);  /* best effort */
+        (void)r;
+    }
     close(fd);
 }
 
 static void register_client(struct server *s, int fd,
                             const struct sockaddr_storage *addr, socklen_t len)
 {
-    char name[CLIENT_NAME_SIZE];
+    char name[CLIENT_ADDR_SIZE];
     net_peer_name(addr, len, name, sizeof name);
 
     struct client *c = client_create(fd, name, net_is_loopback(addr));
     if (c == NULL) {
         LOG_ERROR("out of memory, rejecting %s", name);
-        reject(fd, "SERVER> Server error, try again later\n");
+        close(fd);
         return;
     }
+    do {  /* default nickname: first free guestN */
+        snprintf(c->nick, sizeof c->nick, "guest%u", ++s->guest_counter);
+    } while (find_by_nick(s, c->nick) != NULL);
+    snprintf(c->room, sizeof c->room, "%s", PROTO_DEFAULT_ROOM);
+    tb_init(&c->rate, s->cfg.msg_rate, s->cfg.msg_burst, monotonic_ms());
+
     if (poller_add(s->poller, fd, POLLER_READ) == -1) {
         LOG_ERRNO("poller_add");
         client_destroy(c);
@@ -317,16 +360,8 @@ static void register_client(struct server *s, int fd,
         client_destroy(c);
         return;
     }
-    LOG_INFO("%s connected (%d clients)", c->name, s->nclients);
-
-    sendf(s, c,
-          "SERVER> Welcome %s to the chat server\n"
-          "SERVER> Commands: /quit to leave, /shutdown to stop the server (localhost only)\n",
-          c->name);
-
-    char msg[CLIENT_NAME_SIZE + 32];
-    snprintf(msg, sizeof msg, "SERVER> %s has joined the server\n", c->name);
-    broadcast(s, msg, c);
+    LOG_INFO("%s (%s) connected (%d clients)", c->nick, c->addr, s->nclients);
+    chat_on_connect(s, c);
 }
 
 static void accept_clients(struct server *s)
@@ -351,7 +386,7 @@ static void accept_clients(struct server *s)
         }
         if (s->nclients >= s->cfg.max_clients) {
             LOG_INFO("rejected connection: server full (%d clients)", s->nclients);
-            reject(fd, "SERVER> Server is full, try again later\n");
+            reject(fd, ERR_SERVER_FULL, "Server is full, try again later");
             continue;
         }
         register_client(s, fd, &addr, len);
@@ -359,42 +394,7 @@ static void accept_clients(struct server *s)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Reading and dispatching                                                   */
-
-static void handle_line(struct server *s, struct client *c, const char *line, size_t len)
-{
-    struct command cmd = protocol_parse(line);
-
-    switch (cmd.type) {
-    case CMD_EMPTY:
-        break;
-
-    case CMD_MESSAGE: {
-        char msg[MSG_SIZE];
-        snprintf(msg, sizeof msg, "%s> %.*s\n", c->name, (int)len, line);
-        broadcast(s, msg, NULL);
-        break;
-    }
-
-    case CMD_QUIT:
-        sendf(s, c, "SERVER> Bye\n");
-        c->dead = true;
-        break;
-
-    case CMD_SHUTDOWN:
-        if (c->is_local) {
-            LOG_INFO("shutdown requested by %s", c->name);
-            s->stopping = true;
-        } else {
-            sendf(s, c, "SERVER> /shutdown is only allowed from localhost\n");
-        }
-        break;
-
-    case CMD_UNKNOWN:
-        sendf(s, c, "SERVER> Unknown command: %.*s\n", (int)len, line);
-        break;
-    }
-}
+/* Reading                                                                   */
 
 /* Dispatch every complete line. Returns false if reading should stop. */
 static bool process_lines(struct server *s, struct client *c)
@@ -406,12 +406,12 @@ static bool process_lines(struct server *s, struct client *c)
         case LR_AGAIN:
             return true;
         case LR_TOO_LONG:
-            sendf(s, c, "SERVER> Line too long (limit %d bytes), disconnecting\n",
-                  PROTO_MAX_LINE - 1);
-            c->dead = true;
+            send_err(s, c, ERR_TOO_LONG, "Line longer than %d bytes, disconnecting",
+                     PROTO_MAX_LINE - 1);
+            client_kill(c, "protocol error");
             return false;
         case LR_LINE:
-            handle_line(s, c, line, len);
+            chat_handle_line(s, c, line, len);
             if (c->dead || s->stopping)
                 return false;
             break;
@@ -433,13 +433,13 @@ static void handle_read(struct server *s, struct client *c)
             continue;
         }
         if (n == 0) {                       /* orderly shutdown by peer */
-            c->dead = true;
+            client_kill(c, "connection closed");
             return;
         }
         if (errno == EINTR)
             continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK)
-            c->dead = true;                 /* ECONNRESET etc. */
+            client_kill(c, "connection error");  /* ECONNRESET etc. */
         return;
     }
 }
@@ -504,8 +504,7 @@ static bool output_pending(const struct server *s)
 /* Tell everyone, give queued output a bounded time to drain, then close. */
 static void graceful_shutdown(struct server *s)
 {
-    broadcast(s, "SERVER> Server is shutting down. Bye!\n", NULL);
-    fflush(stdout);
+    send_room(s, NULL, NULL, "INFO Server is shutting down");
 
     /* From here on only write readiness matters: watching input would make a
      * level-triggered poller spin on clients that are still sending. */
@@ -516,7 +515,7 @@ static void graceful_shutdown(struct server *s)
             c->want_write = true;
         } else {
             poller_remove(s->poller, c->fd);
-            c->dead = true;
+            client_kill(c, "server shutdown");
         }
     }
 
@@ -540,7 +539,7 @@ static void graceful_shutdown(struct server *s)
             if ((events[i].events & POLLER_ERROR) ||
                 client_flush(c) != FLUSH_PENDING) {
                 poller_remove(s->poller, c->fd);  /* done or failed */
-                c->dead = true;
+                client_kill(c, "server shutdown");
             }
         }
     }
@@ -548,8 +547,10 @@ static void graceful_shutdown(struct server *s)
 
 static void cleanup(struct server *s)
 {
-    while (s->head != NULL)
+    while (s->head != NULL) {
+        client_kill(s->head, "server shutdown");
         drop_client(s, s->head);
+    }
     free(s->by_fd);
     restore_signals();
     for (int i = 0; i < 2; i++) {
@@ -589,8 +590,10 @@ int server_run(const struct server_config *cfg)
         goto out;
     }
 
-    LOG_INFO("listening on port %s (backend: %s, max %d clients)",
-             cfg->port, poller_backend(), cfg->max_clients);
+    LOG_INFO("listening on port %s (backend: %s, max %d clients, "
+             "rate %.1f msg/s burst %.0f, admin password %s)",
+             cfg->port, poller_backend(), cfg->max_clients,
+             cfg->msg_rate, cfg->msg_burst, cfg->admin_password ? "set" : "not set");
 
     rc = event_loop(&s);
     graceful_shutdown(&s);

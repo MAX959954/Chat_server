@@ -118,16 +118,95 @@ static void test_space_reclaimed_after_lines(void)
     CHECK(line_reader_space(&lr, &dst) == PROTO_MAX_LINE);
 }
 
+static struct command parse(char *buf, const char *line)
+{
+    struct command cmd;
+    strcpy(buf, line);
+    protocol_parse(buf, &cmd);
+    return cmd;
+}
+
 static void test_parse(void)
 {
-    CHECK(protocol_parse("").type == CMD_EMPTY);
-    CHECK(protocol_parse("hello").type == CMD_MESSAGE);
-    CHECK(protocol_parse("shutdown").type == CMD_MESSAGE);  /* plain text */
-    CHECK(protocol_parse("/quit").type == CMD_QUIT);
-    CHECK(protocol_parse("/shutdown").type == CMD_SHUTDOWN);
-    CHECK(protocol_parse("/shutdownx").type == CMD_UNKNOWN);
-    CHECK(protocol_parse("/nope").type == CMD_UNKNOWN);
-    CHECK_STR(protocol_parse("hi there").text, "hi there");
+    char b[256];
+    struct command c;
+
+    CHECK(parse(b, "").type == CMD_EMPTY);
+
+    c = parse(b, "hello world");
+    CHECK(c.type == CMD_MESSAGE);
+    CHECK_STR(c.text, "hello world");
+
+    c = parse(b, "//not a command");             /* escaped slash */
+    CHECK(c.type == CMD_MESSAGE);
+    CHECK_STR(c.text, "/not a command");
+
+    c = parse(b, "/nick alice");
+    CHECK(c.type == CMD_NICK && c.usage == NULL);
+    CHECK_STR(c.arg, "alice");
+    CHECK(parse(b, "/nick").usage != NULL);        /* missing argument */
+    CHECK(parse(b, "/nick a b").usage != NULL);    /* extra argument */
+
+    c = parse(b, "/msg  bob   hi there ");
+    CHECK(c.type == CMD_MSG && c.usage == NULL);
+    CHECK_STR(c.arg, "bob");
+    CHECK_STR(c.text, "hi there ");
+    CHECK(parse(b, "/msg bob").usage != NULL);     /* no text */
+
+    c = parse(b, "/join dev");
+    CHECK(c.type == CMD_JOIN);
+    CHECK_STR(c.arg, "dev");
+
+    CHECK(parse(b, "/list").type == CMD_LIST);
+    CHECK(parse(b, "/list x").usage != NULL);
+    CHECK(parse(b, "/rooms").type == CMD_ROOMS);
+    CHECK(parse(b, "/help").type == CMD_HELP);
+
+    c = parse(b, "/quit");
+    CHECK(c.type == CMD_QUIT && c.usage == NULL);
+    CHECK_STR(c.text, "");
+    c = parse(b, "/quit see you later");
+    CHECK_STR(c.text, "see you later");
+
+    c = parse(b, "/shutdown");
+    CHECK(c.type == CMD_SHUTDOWN && c.arg == NULL && c.usage == NULL);
+    c = parse(b, "/shutdown s3cret");
+    CHECK_STR(c.arg, "s3cret");
+
+    c = parse(b, "/nope arg");
+    CHECK(c.type == CMD_UNKNOWN);
+    CHECK_STR(c.name, "nope");
+    CHECK(parse(b, "/").type == CMD_UNKNOWN);
+    CHECK(parse(b, "/NICK x").type == CMD_UNKNOWN); /* commands are lowercase */
+}
+
+static void test_names(void)
+{
+    CHECK(protocol_valid_name("alice"));
+    CHECK(protocol_valid_name("Bob_2-x"));
+    CHECK(protocol_valid_name("abcdefghijklmnop"));    /* 16 chars */
+    CHECK(!protocol_valid_name("abcdefghijklmnopq"));  /* 17 chars */
+    CHECK(!protocol_valid_name(""));
+    CHECK(!protocol_valid_name("1abc"));
+    CHECK(!protocol_valid_name("_abc"));
+    CHECK(!protocol_valid_name("a b"));
+    CHECK(!protocol_valid_name("al!ce"));
+}
+
+static void test_sanitize(void)
+{
+    char s[] = "hi\x1b[31mred\x07\tend\x7f";
+    protocol_sanitize(s);
+    CHECK_STR(s, "hi?[31mred? end?");
+    char utf8[] = "\xd0\xbf\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82";  /* "привет" */
+    protocol_sanitize(utf8);
+    CHECK_STR(utf8, "\xd0\xbf\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82");
+}
+
+static void test_error_names(void)
+{
+    CHECK_STR(proto_error_name(ERR_NICK_IN_USE), "NICK_IN_USE");
+    CHECK_STR(proto_error_name(ERR_RATE_LIMITED), "RATE_LIMITED");
 }
 
 int main(void)
@@ -139,5 +218,8 @@ int main(void)
     test_too_long();
     test_space_reclaimed_after_lines();
     test_parse();
+    test_names();
+    test_sanitize();
+    test_error_names();
     return CHECK_REPORT();
 }

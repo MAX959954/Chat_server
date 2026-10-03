@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.13)
 project(chat_server C)
 
-# The server uses POSIX sockets and epoll/poll.
+# The server and client use POSIX sockets and epoll/poll.
 # On Windows, build inside WSL or Docker instead of with MSVC.
 if(NOT UNIX)
   message(FATAL_ERROR
@@ -44,9 +44,11 @@ endif()
 add_library(chat_core STATIC
   src/buffer.c
   src/client.c
+  src/commands.c
   src/log.c
   src/net.c
   src/protocol.c
+  src/ratelimit.c
   src/server.c
   src/poller_${CHAT_POLLER_IMPL}.c
 )
@@ -57,10 +59,14 @@ target_compile_options(chat_core PUBLIC -Wall -Wextra -Wpedantic -Wshadow -Wvla)
 add_executable(chat_server src/main.c)
 target_link_libraries(chat_server PRIVATE chat_core)
 
+# console client (reuses the line reader and sanitizer from chat_core)
+add_executable(chat_client tools/chat_client.c)
+target_link_libraries(chat_client PRIVATE chat_core)
+
 # ---- tests (ctest) ----------------------------------------------------------
 enable_testing()
 
-foreach(t buffer protocol)
+foreach(t buffer protocol ratelimit)
   add_executable(test_${t} tests/test_${t}.c)
   target_link_libraries(test_${t} PRIVATE chat_core)
   add_test(NAME unit_${t} COMMAND test_${t})
@@ -70,6 +76,6 @@ find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
   add_test(NAME integration
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_server.py
-                   $<TARGET_FILE:chat_server>)
+                   $<TARGET_FILE:chat_server> $<TARGET_FILE:chat_client>)
   set_tests_properties(integration PROPERTIES TIMEOUT 180)
 endif()
