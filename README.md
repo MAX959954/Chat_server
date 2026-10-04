@@ -13,9 +13,11 @@ own console client.
   (`EMFILE`) and peer resets (`SIGPIPE`)
 - **Security:** bounded memory per client, control-character sanitizing (no
   terminal escape injection), `/shutdown` only from localhost or with an admin password
-- **Operations:** graceful shutdown on `SIGINT`/`SIGTERM` (self-pipe), timestamped logs
+- **Operations:** graceful shutdown on `SIGINT`/`SIGTERM` (self-pipe), timestamped logs,
+  multi-stage Docker image that only builds if every test passes
 - **Quality:** unit and integration tests (72 checks), ASan/UBSan build, clean under
-  `-Wall -Wextra -Wpedantic` with gcc and clang
+  `-Wall -Wextra -Wpedantic` with gcc and clang; GitHub Actions CI over
+  gcc/clang × epoll/poll × sanitizers, plus a Docker smoke test
 
 ## Platform
 
@@ -23,6 +25,23 @@ POSIX only (Linux, WSL, macOS). On Windows, build and run it inside WSL or
 Docker; CMake stops with a clear error on non-POSIX platforms.
 
 ## Build and run
+
+**Docker** (any OS — the easiest way on Windows or macOS):
+
+```sh
+docker build -t chat_server .                    # compiles and runs the whole test suite
+docker run -d --name chat -p 65001:65001 chat_server
+docker exec -it chat chat_client                 # or: nc localhost 65001
+docker run --rm -p 65001:65001 chat_server -m 5000 -r 10   # extra flags
+docker stop chat                                 # graceful shutdown, exits 0
+```
+
+The image runs as an unprivileged user. Connections through a published port
+arrive from the Docker gateway, not localhost, so `/shutdown` from outside the
+container needs `-e CHAT_ADMIN_PASSWORD=...`; `docker exec` clients connect
+over the container's own loopback and can always shut it down.
+
+**Natively** on Linux, WSL or macOS:
 
 ```sh
 cmake -B build
