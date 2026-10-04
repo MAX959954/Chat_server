@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.compiler }} / ${{ matrix.poller }} / sanitize=${{ matrix.sanitize }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        poller: [epoll, poll]
+        sanitize: [OFF, ON]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.compiler }}
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCHAT_POLLER=${{ matrix.poller }}
+          -DCHAT_SANITIZE=${{ matrix.sanitize }}
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure
+
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (runs the test suite inside)
+        run: docker build -t chat_server .
+      - name: Smoke test
+        run: |
+          docker run -d --name chat -p 65001:65001 chat_server
+          for i in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/65001) 2>/dev/null && break; sleep 0.1; done
+          reply=$(printf '/nick alice\n/quit\n' | nc -q1 127.0.0.1 65001)
+          echo "$reply"
+          echo "$reply" | grep -q '^OK NICK alice'
+      - name: docker stop shuts down gracefully
+        run: |
+          time docker stop chat
+          docker logs chat
+          [ "$(docker inspect -f '{{.State.ExitCode}}' chat)" = "0" ]
